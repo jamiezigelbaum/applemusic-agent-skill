@@ -74,6 +74,10 @@ DEFAULT_TOKEN_PATH = "~/.config/applemusic-agent/tokens.json"
 # nobody looks at the tool for a while.
 TOKEN_EXPIRY_WARN_DAYS = 14
 
+# Apple throttles bursts of catalog calls with HTTP 429. Retries are cheap and
+# the alternative is a caller mistaking a rate limit for a dead credential.
+RATE_LIMIT_RETRIES = 4
+
 # A successful POST to /v1/me/library returns HTTP 202 with a *completely empty
 # body*. MusicKit tries to JSON.parse that empty string and the promise rejects.
 # These are the parse-failure messages that therefore mean SUCCESS, not failure.
@@ -478,7 +482,8 @@ class MusicSession:
                 "Object.keys(res).forEach(function(k){out[k]=((res[k]||{}).data||[])"
                 ".map(function(x){var a=x.attributes||{};return {id:x.id, type:x.type,"
                 "name:a.name||null, artistName:a.artistName||null, albumName:a.albumName||null,"
-                "durationInMillis:a.durationInMillis||null, releaseDate:a.releaseDate||null};});});"
+                "durationInMillis:a.durationInMillis||null, releaseDate:a.releaseDate||null,"
+                "genreNames:a.genreNames||[]};});});"
                 "return {status:r.status, errors:r.errors||null, results:out};})" % json.dumps(path))
         res = self.eval_async(expr)
         if not res.get("ok"):
@@ -621,22 +626,40 @@ class ApiSession:
     # -- transport --------------------------------------------------------
 
     def _request(self, path, method="GET", timeout=None):
+        """One request, retrying only what is worth retrying.
+
+        Apple throttles bursts with 429 and reports it as "Request is
+        forbidden", which reads like an auth failure and is not one - a caller
+        that treats it as fatal concludes its credentials died. Back off and
+        retry instead; anything still 429 after the last attempt is returned as
+        itself so the caller sees the truth.
+        """
         url = path if path.startswith("http") else API_BASE + path
-        req = urllib.request.Request(url, method=method,
-                                     data=b"" if method == "POST" else None)
-        req.add_header("Authorization", "Bearer " + self.tokens["developer_token"])
-        req.add_header("Music-User-Token", self.tokens["music_user_token"])
-        req.add_header("Origin", API_ORIGIN)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
-                body = resp.read()
-                return resp.status, body
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
-        except urllib.error.URLError as exc:
-            raise ToolError("Could not reach Apple Music: %s" % exc.reason,
-                            remedy="Check network connectivity.",
-                            code="network", exit_code=EXIT_ENVIRONMENT)
+        delay = 1.0
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            req = urllib.request.Request(url, method=method,
+                                         data=b"" if method == "POST" else None)
+            req.add_header("Authorization", "Bearer " + self.tokens["developer_token"])
+            req.add_header("Music-User-Token", self.tokens["music_user_token"])
+            req.add_header("Origin", API_ORIGIN)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                    return resp.status, resp.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429 or attempt == RATE_LIMIT_RETRIES:
+                    return exc.code, exc.read()
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    wait = float(retry_after) if retry_after else delay
+                except ValueError:
+                    wait = delay
+                time.sleep(min(wait, 30.0))
+                delay *= 2
+            except urllib.error.URLError as exc:
+                raise ToolError("Could not reach Apple Music: %s" % exc.reason,
+                                remedy="Check network connectivity.",
+                                code="network", exit_code=EXIT_ENVIRONMENT)
+        return 429, b""
 
     def _json(self, path, timeout=None):
         status, body = self._request(path, timeout=timeout)
@@ -773,6 +796,7 @@ class ApiSession:
                     "albumName": attrs.get("albumName"),
                     "durationInMillis": attrs.get("durationInMillis"),
                     "releaseDate": attrs.get("releaseDate"),
+                    "genreNames": attrs.get("genreNames") or [],
                 })
         return out
 
