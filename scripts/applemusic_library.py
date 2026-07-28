@@ -13,28 +13,66 @@ make user-scoped API calls on its own behalf. We drive that page over Apple
 Events and read the answers back. No developer token, no Music User Token, no
 Apple Developer Program membership.
 
-Python 3.8+, standard library only. Shells out to `osascript`.
+TWO MODES
+---------
+The signed-in page will also *hand you* the credential pair it is using -
+`MusicKit.getInstance().developerToken` and `.musicUserToken` - and that pair
+works from an ordinary HTTPS client with no browser at all.
+
+- `safari`  drives the page over Apple Events. macOS + Safari only.
+- `http`    talks straight to api.music.apple.com with a harvested token pair.
+            Runs anywhere, including Linux, headless, with no window on anyone's
+            screen.
+
+`harvest` moves you from the first to the second: it reads the pair out of the
+live page once and writes it to a token file. After that, the browser is only
+needed again when the developer token expires (~70 days; `doctor` warns first).
+
+Python 3.8+, standard library only. `safari` mode shells out to `osascript`.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import uuid
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 # Exit codes.
 EXIT_OK = 0
 EXIT_FAILED = 1  # the command ran but the operation did not fully succeed
 EXIT_USAGE = 2  # bad arguments
-EXIT_ENVIRONMENT = 3  # the Safari session is not usable; `doctor` explains
+EXIT_ENVIRONMENT = 3  # the session is not usable; `doctor` explains
+
+API_BASE = "https://api.music.apple.com"
+
+# The developer token the web player uses carries a `root_https_origin` claim,
+# and Apple enforces it: send these calls without an Origin header and every one
+# of them returns 401, including calls that need no user scope at all. This is
+# the single easiest thing to get wrong when moving off the browser.
+API_ORIGIN = "https://music.apple.com"
+
+ENV_DEV_TOKEN = "APPLE_MUSIC_DEVELOPER_TOKEN"
+ENV_USER_TOKEN = "APPLE_MUSIC_USER_TOKEN"
+DEFAULT_TOKEN_PATH = "~/.config/applemusic-agent/tokens.json"
+
+# Warn this far ahead of developer-token expiry. Expiry is a cliff, not a
+# degradation: the token stops working outright, and re-harvesting needs a human
+# at a signed-in Safari. Two weeks is enough notice to catch a warning even if
+# nobody looks at the tool for a while.
+TOKEN_EXPIRY_WARN_DAYS = 14
 
 # A successful POST to /v1/me/library returns HTTP 202 with a *completely empty
 # body*. MusicKit tries to JSON.parse that empty string and the promise rejects.
@@ -456,6 +494,290 @@ class MusicSession:
 
 
 # --------------------------------------------------------------------------
+# tokens
+# --------------------------------------------------------------------------
+
+def token_path(explicit=None):
+    return os.path.expanduser(explicit or os.environ.get("APPLE_MUSIC_TOKEN_FILE")
+                              or DEFAULT_TOKEN_PATH)
+
+
+def jwt_expiry(token):
+    """Return the `exp` of a JWT as an aware datetime, or None if unreadable.
+
+    The developer token is a signed JWT whose payload is plain base64 - reading
+    the expiry needs no secret and no verification, because we are not deciding
+    whether to trust it, only when to warn that it is about to die.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return datetime.datetime.fromtimestamp(int(claims["exp"]), datetime.timezone.utc)
+    except Exception:
+        return None
+
+
+def load_tokens(explicit_path=None):
+    """Find a token pair: environment first, then the token file.
+
+    Environment wins so a caller can inject credentials for one invocation
+    without them ever touching disk - which is how this runs under a secret
+    broker.
+    """
+    dev = os.environ.get(ENV_DEV_TOKEN)
+    user = os.environ.get(ENV_USER_TOKEN)
+    if dev and user:
+        return {"developer_token": dev, "music_user_token": user, "source": "environment"}
+
+    path = token_path(explicit_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise ToolError("Token file %s is unreadable: %s" % (path, exc),
+                        remedy="Re-run `harvest` on a Mac with a signed-in Safari.",
+                        code="bad_token_file", exit_code=EXIT_ENVIRONMENT)
+    if not data.get("developer_token") or not data.get("music_user_token"):
+        raise ToolError("Token file %s is missing a token." % path,
+                        remedy="Re-run `harvest` on a Mac with a signed-in Safari.",
+                        code="bad_token_file", exit_code=EXIT_ENVIRONMENT)
+    data["source"] = path
+    return data
+
+
+def save_tokens(tokens, explicit_path=None):
+    path = token_path(explicit_path)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+        os.chmod(directory, stat.S_IRWXU)
+    # Create the file private and *then* write, so the tokens are never briefly
+    # readable by anyone else.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(tokens, handle, indent=2)
+        handle.write("\n")
+    return path
+
+
+def harvest_from_safari(session):
+    """Read the credential pair out of the live signed-in page."""
+    res = session.eval_async(
+        "(function(){var m=MusicKit.getInstance();"
+        "return {dev:m.developerToken||null, user:m.musicUserToken||null,"
+        " storefront:m.storefrontId||null};})()")
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        raise ToolError("Could not read the tokens from the page: %s"
+                        % (err.get("message") or "unknown"), code="harvest_failed")
+    value = res.get("value") or {}
+    if not value.get("dev") or not value.get("user"):
+        raise ToolError("The page did not expose a token pair.",
+                        remedy="Confirm the tab is signed in - run `doctor --safari`.",
+                        code="harvest_empty", exit_code=EXIT_ENVIRONMENT)
+    expiry = jwt_expiry(value["dev"])
+    return {
+        "developer_token": value["dev"],
+        "music_user_token": value["user"],
+        "storefront": value.get("storefront"),
+        "harvested_at": datetime.datetime.now(datetime.timezone.utc)
+                                .replace(microsecond=0).isoformat(),
+        "developer_token_expires": expiry.replace(microsecond=0).isoformat() if expiry else None,
+    }
+
+
+# --------------------------------------------------------------------------
+# http session - no browser
+# --------------------------------------------------------------------------
+
+class ApiSession:
+    """The same surface as MusicSession, over plain HTTPS.
+
+    Deliberately talks to the PUBLIC api.music.apple.com, not the `amp-api`
+    host the web player uses. The amp-api quirks documented on MusicSession
+    (`api.music` rejecting `ids[songs]`, `filter[catalog]` being refused) are
+    properties of in-page MusicKit calls; a direct client is not bound by them.
+    The one behaviour that does carry over is the empty success body - see
+    `add_to_library`.
+    """
+
+    def __init__(self, tokens, timeout=30.0):
+        self.tokens = tokens
+        self.timeout = timeout
+        self._storefront = tokens.get("storefront")
+
+    def find_tab(self, refresh=False):
+        """No-op: there is no tab. Present so commands can call it either way.
+
+        Commands establish the session before working, which for Safari means
+        locating an authorised tab. Over HTTPS there is nothing to locate - the
+        credentials either work or `doctor` says why not.
+        """
+        return None
+
+    # -- transport --------------------------------------------------------
+
+    def _request(self, path, method="GET", timeout=None):
+        url = path if path.startswith("http") else API_BASE + path
+        req = urllib.request.Request(url, method=method,
+                                     data=b"" if method == "POST" else None)
+        req.add_header("Authorization", "Bearer " + self.tokens["developer_token"])
+        req.add_header("Music-User-Token", self.tokens["music_user_token"])
+        req.add_header("Origin", API_ORIGIN)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+                body = resp.read()
+                return resp.status, body
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+        except urllib.error.URLError as exc:
+            raise ToolError("Could not reach Apple Music: %s" % exc.reason,
+                            remedy="Check network connectivity.",
+                            code="network", exit_code=EXIT_ENVIRONMENT)
+
+    def _json(self, path, timeout=None):
+        status, body = self._request(path, timeout=timeout)
+        if status == 401 or status == 403:
+            raise ToolError("Apple Music rejected the stored credentials (HTTP %d)." % status,
+                            remedy="The tokens have expired or been revoked. Re-run "
+                                   "`harvest` on a Mac with a signed-in Safari.",
+                            code="unauthorized", exit_code=EXIT_ENVIRONMENT)
+        payload = {}
+        if body:
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = {}
+        if status >= 400:
+            detail = _first_error_detail(payload.get("errors"))
+            raise ToolError("Apple Music returned HTTP %d%s" % (status, (": " + detail) if detail else ""),
+                            code="http_%d" % status)
+        return payload
+
+    # -- Apple Music API --------------------------------------------------
+
+    def api_get(self, path, timeout=None):
+        return self._json(path, timeout=timeout)
+
+    def storefront(self):
+        if self._storefront:
+            return self._storefront
+        data = self._json("/v1/me/storefront")
+        items = data.get("data") or []
+        if not items or not items[0].get("id"):
+            raise ToolError("Could not determine your Apple Music storefront.",
+                            remedy="Re-run `harvest`; the stored tokens may be stale.",
+                            code="no_storefront", exit_code=EXIT_ENVIRONMENT)
+        self._storefront = items[0]["id"]
+        return self._storefront
+
+    # -- library mutation -------------------------------------------------
+
+    def add_to_library(self, catalog_id, kind="songs"):
+        """POST the catalog id into the library.
+
+        A successful add is HTTP 202 with a completely empty body. That is the
+        same behaviour that, inside MusicKit, surfaces as a JSON parse failure -
+        it is Apple's, not the browser's. Here it needs no special handling
+        beyond not treating an empty body as a fault.
+        """
+        path = "/v1/me/library?ids[%s]=%s" % (kind, urllib.parse.quote(str(catalog_id), safe=""))
+        status, body = self._request(path, method="POST")
+        if status in (401, 403):
+            raise ToolError("Apple Music rejected the stored credentials (HTTP %d)." % status,
+                            remedy="Re-run `harvest` on a Mac with a signed-in Safari.",
+                            code="unauthorized", exit_code=EXIT_ENVIRONMENT)
+        if 200 <= status < 300:
+            return {"accepted": True, "detail": "HTTP %d%s" % (
+                status, " (empty body, expected on success)" if not body else "")}
+        detail = ""
+        if body:
+            try:
+                detail = _first_error_detail(json.loads(body).get("errors"))
+            except ValueError:
+                detail = body[:120].decode("utf-8", "replace")
+        return {"accepted": False, "detail": "HTTP %d%s" % (status, (": " + detail) if detail else "")}
+
+    # -- lookups ----------------------------------------------------------
+
+    def catalog_songs(self, catalog_ids):
+        sf = self.storefront()
+        ids = ",".join(urllib.parse.quote(str(i), safe="") for i in catalog_ids)
+        try:
+            data = self._json("/v1/catalog/%s/songs?ids=%s" % (urllib.parse.quote(sf, safe=""), ids))
+        except ToolError:
+            return {}
+        out = {}
+        for item in data.get("data") or []:
+            attrs = item.get("attributes") or {}
+            if item.get("id"):
+                out[item["id"]] = {
+                    "id": item["id"],
+                    "name": attrs.get("name"),
+                    "artistName": attrs.get("artistName"),
+                    "albumName": attrs.get("albumName"),
+                    "durationInMillis": attrs.get("durationInMillis"),
+                }
+        return out
+
+    def find_library_song(self, catalog_id, title=None):
+        """Return the library song (`i.xxxx`) for a catalog id, or None.
+
+        Same two-pass strategy as the Safari path, and for the same reason: a
+        title search misses a track added seconds ago, and the recently-added
+        scan misses anything older than the window.
+        """
+        catalog_id = str(catalog_id)
+        if title:
+            hit = self._match_in(
+                "/v1/me/library/search?term=%s&types=library-songs&limit=25"
+                % urllib.parse.quote(title, safe=""),
+                catalog_id, results_key="library-songs")
+            if hit:
+                return hit
+        return self._match_in("/v1/me/library/songs?limit=50&sort=-dateAdded", catalog_id)
+
+    def _match_in(self, path, catalog_id, results_key=None):
+        try:
+            data = self._json(path)
+        except ToolError:
+            return None
+        if results_key:
+            items = ((data.get("results") or {}).get(results_key) or {}).get("data") or []
+        else:
+            items = data.get("data") or []
+        for item in items:
+            attrs = item.get("attributes") or {}
+            found = (attrs.get("playParams") or {}).get("catalogId")
+            if found and str(found) == catalog_id:
+                return {"id": item.get("id"), "name": attrs.get("name"),
+                        "artistName": attrs.get("artistName"), "catalogId": str(found)}
+        return None
+
+    def search_catalog(self, term, types="songs", limit=10):
+        sf = self.storefront()
+        data = self._json("/v1/catalog/%s/search?term=%s&types=%s&limit=%d"
+                          % (urllib.parse.quote(sf, safe=""), urllib.parse.quote(term, safe=""),
+                             urllib.parse.quote(types, safe=""), limit))
+        out = {}
+        for key, block in (data.get("results") or {}).items():
+            out[key] = []
+            for item in block.get("data") or []:
+                attrs = item.get("attributes") or {}
+                out[key].append({
+                    "id": item.get("id"), "type": item.get("type"),
+                    "name": attrs.get("name"), "artistName": attrs.get("artistName"),
+                    "albumName": attrs.get("albumName"),
+                    "durationInMillis": attrs.get("durationInMillis"),
+                    "releaseDate": attrs.get("releaseDate"),
+                })
+        return out
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 
@@ -523,6 +845,65 @@ def _emit(payload, as_json, text_lines):
 # --------------------------------------------------------------------------
 
 def cmd_doctor(session, args):
+    """Check whichever transport is actually in use.
+
+    The two modes fail in completely different ways - a missing Develop-menu
+    switch means nothing to an HTTPS client, and an expired token means nothing
+    to a live page - so they get separate check lists rather than one list with
+    half its entries skipped.
+    """
+    if isinstance(session, ApiSession):
+        return _doctor_http(session, args)
+    return _doctor_safari(session, args)
+
+
+def _doctor_http(session, args):
+    checks = []
+
+    def record(name, ok, detail, remedy=None):
+        checks.append({"check": name, "ok": bool(ok), "detail": detail,
+                       "remedy": None if ok else remedy})
+        return ok
+
+    record("tokens_present", True, "loaded from %s" % session.tokens.get("source", "?"), None)
+
+    expiry = jwt_expiry(session.tokens["developer_token"])
+    if expiry is None:
+        record("token_expiry", False, "developer token is not a readable JWT",
+               "Re-run `harvest`; the stored value looks corrupt.")
+    else:
+        left = expiry - datetime.datetime.now(datetime.timezone.utc)
+        days = left.days
+        if days < 0:
+            record("token_expiry", False,
+                   "developer token EXPIRED %s (%d days ago)" % (expiry.date(), -days),
+                   "Re-run `harvest` on a Mac with a signed-in Safari.")
+        elif days < TOKEN_EXPIRY_WARN_DAYS:
+            record("token_expiry", False,
+                   "developer token expires %s - only %d days left" % (expiry.date(), days),
+                   "Re-run `harvest` soon; when it expires every call returns 401.")
+        else:
+            record("token_expiry", True,
+                   "developer token valid until %s (%d days)" % (expiry.date(), days), None)
+
+    try:
+        storefront = session.storefront()
+        record("api_reachable", True,
+               "GET /v1/me/storefront succeeded (storefront: %s)" % storefront, None)
+    except ToolError as exc:
+        record("api_reachable", False, exc.message, exc.remedy)
+        return _doctor_report(checks, args)
+
+    try:
+        session.api_get("/v1/me/library/songs?limit=1")
+        record("library_scope", True, "user-scoped read succeeded", None)
+    except ToolError as exc:
+        record("library_scope", False, exc.message, exc.remedy)
+
+    return _doctor_report(checks, args)
+
+
+def _doctor_safari(session, args):
     checks = []
 
     def record(name, ok, detail, remedy=None):
@@ -591,6 +972,34 @@ def _doctor_report(checks, args):
     lines.append("doctor: %s" % ("all checks passed" if ok else "one or more checks failed"))
     _emit(payload, args.json, lines)
     return EXIT_OK if ok else EXIT_ENVIRONMENT
+
+
+def cmd_harvest(session, args):
+    """Read the token pair out of the live page and store it.
+
+    This is the only command that requires Safari. Everything else can run off
+    what this writes, on any machine.
+    """
+    session.find_tab()
+    tokens = harvest_from_safari(session)
+    if args.stdout:
+        # For a caller that wants to put these somewhere else entirely - a
+        # secret manager, say - without them ever landing on disk here.
+        print(json.dumps(tokens, indent=2))
+        return EXIT_OK
+
+    path = save_tokens(tokens, args.token_file)
+    expires = tokens.get("developer_token_expires")
+    lines = ["wrote token pair to %s (mode 0600)" % path,
+             "storefront: %s" % (tokens.get("storefront") or "unknown")]
+    if expires:
+        left = jwt_expiry(tokens["developer_token"]) - datetime.datetime.now(datetime.timezone.utc)
+        lines.append("developer token expires %s (%d days) - re-run `harvest` before then"
+                     % (expires[:10], left.days))
+    _emit({"ok": True, "command": "harvest", "path": path,
+           "storefront": tokens.get("storefront"),
+           "developer_token_expires": expires}, args.json, lines)
+    return EXIT_OK
 
 
 def cmd_storefront(session, args):
@@ -750,10 +1159,15 @@ def _add_common_flags(parser, top_level):
     """
     json_default = False if top_level else argparse.SUPPRESS
     timeout_default = 30.0 if top_level else argparse.SUPPRESS
+    suppress = argparse.SUPPRESS
     parser.add_argument("--json", action="store_true", default=json_default,
                         help="emit machine-readable JSON")
     parser.add_argument("--timeout", type=float, default=timeout_default,
                         help="seconds to wait for each Apple Music call (default: 30)")
+    parser.add_argument("--token-file", default=(None if top_level else suppress),
+                        help="token pair to use (default: %s)" % DEFAULT_TOKEN_PATH)
+    parser.add_argument("--safari", action="store_true", default=(False if top_level else suppress),
+                        help="force the browser transport even if a token pair is stored")
 
 
 def build_parser():
@@ -769,8 +1183,12 @@ def build_parser():
         _add_common_flags(child, top_level=False)
         return child
 
-    add_sub("doctor", "check that the Safari session is usable")
+    add_sub("doctor", "check that the current transport is usable")
     add_sub("storefront", "print the signed-in storefront code")
+
+    p_harvest = add_sub("harvest", "store the token pair so later runs need no browser")
+    p_harvest.add_argument("--stdout", action="store_true",
+                           help="print the tokens instead of writing them (for a secret manager)")
 
     p_search = add_sub("search", "search the Apple Music catalog (no developer token)")
     p_search.add_argument("query", help="search terms")
@@ -790,6 +1208,32 @@ def build_parser():
     return parser
 
 
+def resolve_session(args):
+    """Choose the transport.
+
+    Prefer HTTPS whenever a token pair is available: it is faster, needs no
+    window on anyone's screen, and works off this machine. Fall back to Safari
+    only when there is nothing stored - and say so plainly on a host where
+    Safari is not an option, rather than failing later with something obscure.
+    """
+    if args.command == "harvest":
+        # Harvesting is precisely the act of reading the live page.
+        return MusicSession(timeout=args.timeout)
+
+    if not args.safari:
+        tokens = load_tokens(args.token_file)
+        if tokens:
+            return ApiSession(tokens, timeout=args.timeout)
+
+    if sys.platform != "darwin":
+        raise ToolError("No stored token pair, and the browser transport needs macOS.",
+                        remedy="Run `harvest` on a Mac with a signed-in Safari, then "
+                               "copy %s here (or set %s and %s)."
+                               % (DEFAULT_TOKEN_PATH, ENV_DEV_TOKEN, ENV_USER_TOKEN),
+                        code="no_transport", exit_code=EXIT_ENVIRONMENT)
+    return MusicSession(timeout=args.timeout)
+
+
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -798,9 +1242,9 @@ def main(argv=None):
         return EXIT_USAGE
 
     handlers = {"doctor": cmd_doctor, "storefront": cmd_storefront, "search": cmd_search,
-                "add": cmd_add, "resolve-library-id": cmd_resolve}
-    session = MusicSession(timeout=args.timeout)
+                "add": cmd_add, "resolve-library-id": cmd_resolve, "harvest": cmd_harvest}
     try:
+        session = resolve_session(args)
         return handlers[args.command](session, args)
     except ToolError as exc:
         if args.json:

@@ -1,9 +1,42 @@
 ---
 name: apple-music-library
-description: Add Apple Music *catalog* tracks to the user's library on macOS, and resolve catalog IDs to library IDs. Use when the user asks to add, save, or queue a song that is not already in their library, when AppleScript reports a track cannot be found, or when building a playlist from catalog search results. Works through an already signed-in Safari tab on music.apple.com - no developer token, no Music User Token, no Apple Developer Program membership.
+description: Search the Apple Music *catalog* and add catalog tracks to the user's library, and resolve catalog IDs to library IDs. Use when the user asks to add, save, or queue a song that is not already in their library, when AppleScript reports a track cannot be found, or when building a playlist from catalog search results. Borrows an already signed-in Safari session on macOS - no developer token, no Music User Token, no Apple Developer Program membership - and can then run headless anywhere, including Linux.
 ---
 
 # Apple Music library additions
+
+## Two modes - read this first
+
+| Mode | Transport | Runs on | Needs |
+| --- | --- | --- | --- |
+| `safari` | Apple Events → a signed-in Safari tab | macOS only | Safari open, signed in |
+| `http` | plain HTTPS → `api.music.apple.com` | anywhere, headless | a stored token pair |
+
+The signed-in page will hand you the credential pair it is using
+(`MusicKit.getInstance().developerToken` and `.musicUserToken`), and **that pair
+works from an ordinary HTTPS client with no browser at all**.
+
+```bash
+python3 scripts/applemusic_library.py harvest   # once, on the Mac
+```
+
+After that every command picks `http` automatically and no window opens on
+anyone's screen. Force the old path with `--safari`.
+
+**The developer token expires after ~70 days.** That is a cliff, not a
+degradation - when it lapses, every call returns 401. `doctor` warns 14 days
+ahead; re-run `harvest` to refresh.
+
+Token pair lookup order: `APPLE_MUSIC_DEVELOPER_TOKEN` + `APPLE_MUSIC_USER_TOKEN`
+in the environment, then `--token-file`, then `~/.config/applemusic-agent/tokens.json`
+(written 0600). `harvest --stdout` prints the pair instead of writing it, for
+handing straight to a secret manager.
+
+### The one thing that will waste your afternoon
+
+Direct HTTPS calls **must** send `Origin: https://music.apple.com`. The developer
+token carries a `root_https_origin` claim and Apple enforces it: without that
+header every call returns 401, including ones needing no user scope.
 
 ## What this does
 
@@ -128,6 +161,11 @@ works on it normally.
 ## Two quirks a maintainer must not "fix"
 
 These look like bugs. They are not. Changing them breaks the tool.
+
+**Both are properties of the in-page MusicKit path.** In `http` mode the empty
+success body arrives as a plain HTTP 202 needing no special handling, and the
+public API accepts the shapes amp-api rejects. Do not "simplify" the Safari path
+to match what works over HTTPS - they are different endpoints.
 
 ### 1. Success arrives as a thrown JSON parse error
 
