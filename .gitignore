@@ -1,3 +1,8 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# Harvested credentials. `--token-file` can point anywhere, including into a
+# clone of this repo - make that mistake unrepeatable rather than unlikely.
+tokens.json
+*.tokens.json
