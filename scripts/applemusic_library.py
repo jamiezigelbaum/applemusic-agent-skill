@@ -568,6 +568,56 @@ def save_tokens(tokens, explicit_path=None):
     return path
 
 
+DEFAULT_CONFIG_PATH = "~/.config/applemusic-agent/config.json"
+PUSH_TIMEOUT_SECONDS = 120
+
+
+def load_config():
+    """Optional local settings. Nothing personal lives in this repository."""
+    path = os.path.expanduser(os.environ.get("APPLE_MUSIC_CONFIG") or DEFAULT_CONFIG_PATH)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ToolError("Config file %s is unreadable: %s" % (path, exc),
+                        code="bad_config", exit_code=EXIT_ENVIRONMENT)
+
+
+def push_tokens(tokens):
+    """Hand a fresh pair to the user's own secret store, if one is configured.
+
+    `push_command` in the config is an argv list. It receives the pair as JSON on
+    stdin - never in argv or the environment, both of which other processes can
+    read - and must exit 0 once the store holds it. Returns None when nothing is
+    configured, otherwise a short description of what ran.
+    """
+    command = load_config().get("push_command")
+    if not command:
+        return None
+    if not isinstance(command, list) or not all(isinstance(a, str) for a in command):
+        raise ToolError("push_command must be a list of strings.",
+                        code="bad_config", exit_code=EXIT_ENVIRONMENT)
+    pair = {k: tokens.get(k) for k in ("developer_token", "music_user_token",
+                                       "storefront", "developer_token_expires")}
+    try:
+        result = subprocess.run([os.path.expanduser(command[0])] + command[1:],
+                                input=json.dumps(pair), text=True, capture_output=True,
+                                timeout=PUSH_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ToolError("push_command did not run: %s" % exc, code="push_failed",
+                        remedy="The token file is saved; fix the command and run `push`.",
+                        exit_code=EXIT_ENVIRONMENT)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+        raise ToolError("push_command exited %d: %s" % (result.returncode, detail[0][:200]),
+                        code="push_failed",
+                        remedy="The token file is saved; fix the command and run `push`.",
+                        exit_code=EXIT_ENVIRONMENT)
+    return os.path.basename(command[0])
+
+
 def harvest_from_safari(session):
     """Read the credential pair out of the live signed-in page."""
     res = session.eval_async(
@@ -1020,9 +1070,31 @@ def cmd_harvest(session, args):
         left = jwt_expiry(tokens["developer_token"]) - datetime.datetime.now(datetime.timezone.utc)
         lines.append("developer token expires %s (%d days) - re-run `harvest` before then"
                      % (expires[:10], left.days))
+    pushed = push_tokens(tokens)
+    if pushed:
+        lines.append("pushed the pair through push_command (%s)" % pushed)
     _emit({"ok": True, "command": "harvest", "path": path,
            "storefront": tokens.get("storefront"),
-           "developer_token_expires": expires}, args.json, lines)
+           "developer_token_expires": expires, "pushed": bool(pushed)}, args.json, lines)
+    return EXIT_OK
+
+
+def cmd_push(session, args):
+    """Send the stored pair through push_command without opening Safari."""
+    tokens = load_tokens(args.token_file)
+    if not tokens:
+        raise ToolError("No stored token pair to push.", code="no_tokens",
+                        remedy="Run `harvest` first.", exit_code=EXIT_ENVIRONMENT)
+    pushed = push_tokens(tokens)
+    if not pushed:
+        raise ToolError("No push_command configured.", code="no_push_command",
+                        remedy="Add \"push_command\" to %s." % DEFAULT_CONFIG_PATH,
+                        exit_code=EXIT_USAGE)
+    expires = jwt_expiry(tokens["developer_token"])
+    _emit({"ok": True, "command": "push", "pushed": True,
+           "developer_token_expires": expires.isoformat() if expires else None},
+          args.json, ["pushed the pair from %s through %s (developer token expires %s)"
+                      % (tokens.get("source"), pushed, expires.date() if expires else "?")])
     return EXIT_OK
 
 
@@ -1214,6 +1286,8 @@ def build_parser():
     p_harvest.add_argument("--stdout", action="store_true",
                            help="print the tokens instead of writing them (for a secret manager)")
 
+    add_sub("push", "send the stored token pair through the configured push_command")
+
     p_search = add_sub("search", "search the Apple Music catalog (no developer token)")
     p_search.add_argument("query", help="search terms")
     p_search.add_argument("--limit", type=int, default=10, help="results per type (default: 10)")
@@ -1243,6 +1317,8 @@ def resolve_session(args):
     if args.command == "harvest":
         # Harvesting is precisely the act of reading the live page.
         return MusicSession(timeout=args.timeout)
+    if args.command == "push":
+        return None
 
     if not args.safari:
         tokens = load_tokens(args.token_file)
@@ -1266,7 +1342,8 @@ def main(argv=None):
         return EXIT_USAGE
 
     handlers = {"doctor": cmd_doctor, "storefront": cmd_storefront, "search": cmd_search,
-                "add": cmd_add, "resolve-library-id": cmd_resolve, "harvest": cmd_harvest}
+                "add": cmd_add, "resolve-library-id": cmd_resolve, "harvest": cmd_harvest,
+                "push": cmd_push}
     try:
         session = resolve_session(args)
         return handlers[args.command](session, args)

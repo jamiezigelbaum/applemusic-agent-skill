@@ -115,6 +115,7 @@ misbehaves — it distinguishes “not signed in” from “expired token” fro
 ```bash
 applemusic-library doctor                    # check the current transport
 applemusic-library harvest                   # store the token pair (macOS only)
+applemusic-library push                      # resend the stored pair to push_command
 applemusic-library search "artist or title" --limit 5 --types songs,albums
 applemusic-library add 1234567890            # ids, comma/space lists, or URLs
 applemusic-library resolve-library-id 1234567890
@@ -216,6 +217,13 @@ Be deliberate about this — `harvest` writes two real credentials to disk.
   `APPLE_MUSIC_DEVELOPER_TOKEN` and `APPLE_MUSIC_USER_TOKEN` are read first, so a
   secret manager can inject them per-invocation and nothing ever lands on disk.
   `harvest --stdout` prints the pair instead of writing it, for exactly that.
+- If the pair is used on another machine through a secret manager, set
+  `push_command` in `~/.config/applemusic-agent/config.json` (an argv list,
+  e.g. `{"push_command": ["~/bin/store-apple-music-tokens"]}`). After every
+  successful `harvest`, the command gets the pair as JSON on stdin and must
+  exit 0 once your store holds it; `push` resends the stored pair. Without
+  this, a re-harvest refreshes only the local file, and a copy elsewhere keeps
+  expiring.
 - The developer token expires in ~70 days. The user token is longer-lived; if it
   is revoked or the account signs out, everything returns `401` until you
   `harvest` again.
